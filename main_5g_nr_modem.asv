@@ -3,7 +3,7 @@ function main_5g_nr_modem_dual
     clear; clc; close all;
 
     %% ----------------- USER PARAMETERS -----------------
-    imgFile      = fullfile('images','campus2.jpeg');   % adjust name if needed
+    imgFile      = fullfile('images','campus.jpeg');   % adjust name if needed
     bitsPerFrame = 2048;              % TB length (information bits)
     snrRange_dB  = 0:4:24;            % SNR points
     modSchemes   = [4 16 64];         % QPSK, 16QAM, 64QAM
@@ -27,7 +27,7 @@ function main_5g_nr_modem_dual
     fprintf('Image bits: %d, blocks: %d\n', numel(imgBits), numBlocks);
 
     %% ----------------- RUN BOTH CHANNELS -----------------
-    chanList = {'awgn','rayleigh', 'rician'};
+    chanList = {'awgn','rayleigh'};
     results = struct();
 
     for ci = 1:numel(chanList)
@@ -48,7 +48,7 @@ function main_5g_nr_modem_dual
     %% ----------------- PLOT: 6 GRAPHS (3 AWGN + 3 Rayleigh) -----------------
     plot_results_5g_channel(results.awgn.fixed, results.awgn.adaptive, snrRange_dB, 'AWGN');
     plot_results_5g_channel(results.rayleigh.fixed, results.rayleigh.adaptive, snrRange_dB, 'Rayleigh');
-    plot_results_5g_channel(results.rayleigh.fixed, results.rayleigh.adaptive, snrRange_dB, 'Rician');
+
     disp('Done. 6 figures generated (3 AWGN + 3 Rayleigh).');
 end
 
@@ -66,15 +66,6 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
     noiseVarFromSNR = @(snr_dB) 10.^(-snr_dB/10);
 
     ofdmSymLen = Nfft + cpLen;
-
-    cfg.targetBLER  = 0.10;
-    cfg.Mlist       = modSchemes;
-    cfg.Rlist       = codeRates;
-
-    combos = all_mcs_combos(cfg.Mlist, cfg.Rlist);
-    nComb  = size(combos,1);
-    stats.tx  = zeros(nComb,length(snrRange_dB));
-    stats.err = zeros(nComb,length(snrRange_dB));
 
     %% ---------- FIXED-SCHEME RESULTS ----------
     resultsFixed = struct([]);
@@ -145,11 +136,6 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
 
                         success = ~any(bitsDec ~= bits);
                     end
-                    
-                    % Update BLER once per TB after HARQ
-                    mcsIdx = find(ismember(combos, [M rate], 'rows'));
-                    stats.tx(mcsIdx, si)  = stats.tx(mcsIdx, si) + 1;
-                    stats.err(mcsIdx, si) = stats.err(mcsIdx, si) + (~success);
 
                     txBitsAll = [txBitsAll; bits];    %#ok<AGROW>
                     rxBitsAll = [rxBitsAll; bitsDec]; %#ok<AGROW>
@@ -183,7 +169,14 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
     %% ---------- ADAPTIVE MODEM ----------
     fprintf('\n=== Adaptive Modem (%s) ===\n', upper(chanType));
 
+    cfg.targetBLER  = 0.10;
+    cfg.Mlist       = modSchemes;
+    cfg.Rlist       = codeRates;
 
+    combos = all_mcs_combos(cfg.Mlist, cfg.Rlist);
+    nComb  = size(combos,1);
+    stats.tx  = zeros(nComb,1);
+    stats.err = zeros(nComb,1);
 
     berA  = zeros(size(snrRange_dB));
     psnrA = zeros(size(snrRange_dB));
@@ -198,11 +191,15 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
         tbSucc = 0;
         totalSubcUses = 0;
 
+        % reset adaptation stats per SNR (clean)
+        stats.tx(:)  = 0;
+        stats.err(:) = 0;
+
         for pass = 1:numPasses
             for b = 1:numBlocks
                 bits = txBlocks(:,b);
 
-                [M, rate, mcsIdx] = choose_mcs_blertarget(combos, stats, cfg.targetBLER, si);
+                [M, rate, mcsIdx] = choose_mcs_blertarget(combos, stats, cfg.targetBLER);
 
                 txCount = 0;
                 success = false;
@@ -246,6 +243,10 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
 
                     success = ~any(bitsDec ~= bits);
                 end
+
+                % Update BLER once per TB after HARQ
+                stats.tx(mcsIdx)  = stats.tx(mcsIdx) + 1;
+                stats.err(mcsIdx) = stats.err(mcsIdx) + (~success);
 
                 txBitsAll = [txBitsAll; bits];    %#ok<AGROW>
                 rxBitsAll = [rxBitsAll; bitsDec]; %#ok<AGROW>
@@ -322,9 +323,9 @@ function combos = all_mcs_combos(Mlist, Rlist)
     combos = combos(ord,:);
 end
 
-function [M, R, idxSel] = choose_mcs_blertarget(combos, stats, targetBLER, si)
+function [M, R, idxSel] = choose_mcs_blertarget(combos, stats, targetBLER)
     se = log2(combos(:,1)) .* combos(:,2);
-    blerHat = (stats.err(:,si) + 1) ./ (stats.tx(:,si) + 2); % Laplace smoothing
+    blerHat = (stats.err + 1) ./ (stats.tx + 1); % Laplace smoothing
     ok = blerHat <= targetBLER;
 
     if any(ok)
@@ -332,7 +333,7 @@ function [M, R, idxSel] = choose_mcs_blertarget(combos, stats, targetBLER, si)
         [~, k] = max(se(cand));
         idxSel = cand(k);
     else
-        idxSel = 1;
+        idxSel = 2;
     end
 
     M = combos(idxSel,1);
@@ -422,30 +423,7 @@ function [rxSig, hSeq] = apply_channel(txSig, snr_dB, chanType, dopplerHz, ofdmS
                 end
                 rxSig = rxSig + noise;
             end
-        case 'rician'
-            K = 6;
-        
-            txPow = mean(abs(txSig).^2);
-            noisePow = txPow * 10.^(-snr_dB/10);
-        
-            noise = sqrt(noisePow/2) * (randn(size(txSig)) + 1j*randn(size(txSig)));
-        
-            numSym = floor(length(txSig)/ofdmSymLen);
-            if numSym < 1, numSym = 1; end
-        
-            h_los = sqrt(K/(K+1));
-            h_nlos = sqrt(1/(K+1)) * ...
-                (randn(numSym,1)+1j*randn(numSym,1))/sqrt(2);
-        
-            hSeq = h_los + h_nlos;
-        
-            rxSig = txSig;
-            for s = 1:numSym
-                idx = (s-1)*ofdmSymLen + (1:ofdmSymLen);
-                idx = idx(idx <= length(txSig));
-                rxSig(idx) = hSeq(s) * txSig(idx);
-            end
-            rxSig = rxSig + noise;
+
         otherwise
             error('Unknown channel type: %s', chanType);
     end
