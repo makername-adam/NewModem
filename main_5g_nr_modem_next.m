@@ -3,7 +3,7 @@ function main_5g_nr_modem_dual
     clear; clc; close all;
 
     %% ----------------- USER PARAMETERS -----------------
-    imgFile      = fullfile('images','campus2.jpeg');   % adjust name if needed
+    imgFile      = fullfile('images','campus.jpeg');   % adjust name if needed
     bitsPerFrame = 2048;              % TB length (information bits)
     snrRange_dB  = 0:4:24;            % SNR points
     modSchemes   = [4 16 64];         % QPSK, 16QAM, 64QAM
