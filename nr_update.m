@@ -1,0 +1,706 @@
+function main_5g_nr_modem_dual
+
+    clear; clc; close all;
+
+    %% ----------------- USER PARAMETERS -----------------
+    imgFile      = fullfile('images','campus.jpg');   % adjust name if needed
+    bitsPerFrame = 2048;              % TB length (information bits)
+    snrRange_dB  = 0:4:24;            % SNR points
+    modSchemes   = [4 16 64];         % QPSK, 16QAM, 64QAM
+    codeRates    = [1/2 3/4];         % punctured repetition-based FEC
+    Nfft         = 64;                % OFDM size
+    cpLen        = 16;                % CP length
+    dopplerHz    = 5;                 % placeholder (not explicitly simulated)
+    harqMaxTx    = 3;                 % HARQ attempts
+    numPasses    = 2;                 % repeat image per SNR for stability
+
+    % Rayleigh realism knob:
+    % false = per-OFDM-symbol flat fading (more realistic, more different from AWGN)
+    % true  = block fading for entire waveform
+    rayleighBlockFading = false;
+
+    rng(1);                           % reproducible
+
+    %% ----------------- PREPARE IMAGE & BITS -----------------
+    [img, imgBits] = img_to_bits(imgFile);
+    [txBlocks, numBlocks] = segment_bits(imgBits, bitsPerFrame);
+    fprintf('Image bits: %d, blocks: %d\n', numel(imgBits), numBlocks);
+
+    %% ----------------- RUN BOTH CHANNELS -----------------
+    chanList = {'awgn','rayleigh', 'rician'};
+    results = struct();
+
+    for ci = 1:numel(chanList)
+        chanType = chanList{ci};
+        fprintf('\n\n=============================\n');
+        fprintf(' Running channel: %s\n', upper(chanType));
+        fprintf('=============================\n');
+
+        [resF, resA] = sim_fixed_and_adaptive( ...
+            txBlocks, img, bitsPerFrame, snrRange_dB, ...
+            Nfft, cpLen, chanType, dopplerHz, ...
+            modSchemes, codeRates, harqMaxTx, numPasses, rayleighBlockFading);
+
+        results.(chanType).fixed    = resF;
+        results.(chanType).adaptive = resA;
+    end
+
+    %% ----------------- PLOT: 6 GRAPHS (3 AWGN + 3 Rayleigh) -----------------
+    plot_results_5g_channel(results.awgn.fixed, results.awgn.adaptive, snrRange_dB, 'AWGN');
+    plot_results_5g_channel(results.rayleigh.fixed, results.rayleigh.adaptive, snrRange_dB, 'Rayleigh');
+    plot_results_5g_channel(results.rician.fixed, results.rician.adaptive, snrRange_dB, 'Rician');
+    disp('Done. 6 figures generated (3 AWGN + 3 Rayleigh).');
+end
+
+%% =======================================================================
+%%                          TOP-LEVEL SIMULATION
+%% =======================================================================
+function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
+    txBlocks, img, bitsPerFrame, snrRange_dB, ...
+    Nfft, cpLen, chanType, dopplerHz, ...
+    modSchemes, codeRates, harqMaxTx, numPasses, rayleighBlockFading)
+
+    numBlocks = size(txBlocks,2);
+
+    % Keep compatible with your LLR scaling:
+    noiseVarFromSNR = @(snr_dB, txSig) mean(abs(txSig).^2) * 10.^(-snr_dB/10);
+
+    ofdmSymLen = Nfft + cpLen;
+
+    cfg.targetBLER  = 0.10;
+    cfg.Mlist       = modSchemes;
+    cfg.Rlist       = codeRates;
+
+    combos = all_mcs_combos(cfg.Mlist, cfg.Rlist);
+    nComb  = size(combos,1);
+    stats.tx  = zeros(nComb,length(snrRange_dB));
+    stats.err = zeros(nComb,length(snrRange_dB));
+
+    %% ---------- FIXED-SCHEME RESULTS ----------
+    resultsFixed = struct([]);
+    for m = 1:length(modSchemes)
+        M     = modSchemes(m);
+        rate  = 1/2;
+        label = sprintf('Fixed-%dQAM-R12', M);
+
+        ber      = zeros(size(snrRange_dB));
+        psnrVals = zeros(size(snrRange_dB));
+        thr      = zeros(size(snrRange_dB));
+
+        fprintf('\n=== %s (%s) ===\n', label, upper(chanType));
+
+        for si = 1:length(snrRange_dB)
+            snr_dB = snrRange_dB(si);
+
+            bitErrs = 0; bitTotal = 0;
+            txBitsAll = []; rxBitsAll = [];
+
+            tbSucc = 0;
+            totalSubcUses = 0;
+            psnrAccum = 0;
+
+            for pass = 1:numPasses
+                for b = 1:numBlocks
+                    bits = txBlocks(:,b);
+
+                    txCount = 0;
+                    success = false;
+                    bitsDec = zeros(size(bits));
+                    llrAccum = [];
+
+                    while ~success && txCount < harqMaxTx
+                        txCount = txCount + 1;
+
+                        bitsEnc = fec_encode(bits, rate);
+                        sym     = qam_mod_bits(bitsEnc, M);
+
+                        numOfdm = ceil(length(sym) / Nfft);
+                         
+
+                        txSig   = ofdm_modulate(sym, Nfft, cpLen);
+                        totalSubcUses = totalSubcUses + length(txSig);
+
+                        [rxSig, hSeq] = apply_channel(txSig, snr_dB, chanType, dopplerHz, ...
+                                                      ofdmSymLen, rayleighBlockFading);
+
+                        rxSym = ofdm_demodulate(rxSig, Nfft, cpLen);
+
+                        [rxSymEq, noiseVarEffVec] = equalize_and_noisevar(rxSym, hSeq, ...
+                                                      noiseVarFromSNR(snr_dB, txSig), Nfft);
+
+                        llr = qam_demod_llr(rxSymEq, M, noiseVarEffVec);
+
+                        % HARQ Chase combining (LLR accumulation)
+                        if isempty(llrAccum)
+                            llrAccum = llr;
+                        else
+                            L = min(numel(llrAccum), numel(llr));
+                        
+                            % -------- FINAL ROBUST FIX --------
+                            scale = noiseVarEffVec;
+                        
+                            if isscalar(scale)
+                                scaleVec = repmat(scale, L, 1);
+                            else
+                                lenScale = numel(scale);
+                        
+                                if lenScale >= L
+                                    scaleVec = scale(1:L);
+                                else
+                                    scaleVec = [scale(:); repmat(scale(end), L - lenScale, 1)];
+                                end
+                            end
+                        
+                            llrAccum(1:L) = llrAccum(1:L) + llr(1:L) ./ max(1e-9, abs(scaleVec));
+                        end
+
+                        bitsDec  = fec_decode(llrAccum, rate);
+                        if numel(bitsDec) < numel(bits)
+                            bitsDec = [bitsDec; zeros(numel(bits)-numel(bitsDec),1)];
+                        else
+                            bitsDec = bitsDec(1:numel(bits));
+                        end
+
+                        errRate = sum(bits ~= bitsDec) / numel(bits);
+                        success = (errRate < 0.1);  % allow small errors
+                    end
+                    
+                    % Update BLER once per TB after HARQ
+                    mcsIdx = find(ismember(combos, [M rate], 'rows'));
+                    stats.tx(mcsIdx, si)  = stats.tx(mcsIdx, si) + 1;
+                    stats.err(mcsIdx, si) = stats.err(mcsIdx, si) + (~success);
+
+                    txBitsAll = [txBitsAll; bits];
+
+                    if success
+                        rxBitsAll = [rxBitsAll; bitsDec];
+                    else
+                        % -------- FIX: avoid catastrophic PSNR drop --------
+                        % Option 1 (recommended): use previous successful block
+                        if ~isempty(rxBitsAll)
+                            prev = rxBitsAll(end-numel(bits)+1:end);
+                            rxBitsAll = [rxBitsAll; prev];
+                        else
+                            rxBitsAll = [rxBitsAll; zeros(size(bits))];
+                        end
+                    end
+
+                    bitErrs  = bitErrs + sum(bits~=bitsDec);
+                    bitTotal = bitTotal + numel(bits);
+
+                    if success
+                        tbSucc = tbSucc + 1;
+                    end
+                end
+                numImgBits = numel(img(:)) * 8;
+                rxBitsAllPass = rxBitsAll(1:numImgBits);
+            
+                imgRec = bits_to_img(rxBitsAllPass, img);
+                psnrAccum = psnrAccum + psnr_calc(img, imgRec);
+            end
+
+            ber(si)      = bitErrs/bitTotal;
+
+            numImgBits = numel(img(:)) * 8;
+            rxBitsAll  = rxBitsAll(1:numImgBits);
+            % imgRec       = bits_to_img(rxBitsAll, img);
+            % psnrVals(si) = psnr_calc(img, imgRec);
+            psnrVals(si) = psnrAccum / numPasses;
+            thr(si) = (bitTotal - bitErrs) / max(1, totalSubcUses);
+
+            fprintf('%s: SNR=%2d dB, BER=%.3e, PSNR=%.2f, Thr=%.3f\n',...
+                label, snr_dB, ber(si), psnrVals(si), thr(si));
+        end
+
+        resultsFixed(m).label = label;
+        resultsFixed(m).ber   = ber;
+        resultsFixed(m).psnr  = psnrVals;
+        resultsFixed(m).thr   = thr;
+        resultsFixed(m).M     = M;
+        resultsFixed(m).R     = rate;
+    end
+
+    %% ---------- ADAPTIVE MODEM ----------
+    fprintf('\n=== Adaptive Modem (%s) ===\n', upper(chanType));
+
+
+
+    berA  = zeros(size(snrRange_dB));
+    psnrA = zeros(size(snrRange_dB));
+    thrA  = zeros(size(snrRange_dB));
+
+    for si = 1:length(snrRange_dB)
+        snr_dB = snrRange_dB(si);
+
+        bitErrs = 0; bitTotal = 0;
+        txBitsAll = []; rxBitsAll = [];
+
+        tbSucc = 0;
+        totalSubcUses = 0;
+        psnrAccum = 0;
+
+        for pass = 1:numPasses
+            for b = 1:numBlocks
+                bits = txBlocks(:,b);
+
+                [M, rate, mcsIdx] = choose_mcs_blertarget(combos, stats, cfg.targetBLER, si);
+
+                txCount = 0;
+                success = false;
+                bitsDec = zeros(size(bits));
+                llrAccum = [];
+
+                while ~success && txCount < harqMaxTx
+                    txCount = txCount + 1;
+
+                    bitsEnc = fec_encode(bits, rate);
+                    sym     = qam_mod_bits(bitsEnc, M);
+
+                    numOfdm = ceil(length(sym) / Nfft);
+                    totalSubcUses = totalSubcUses + numOfdm * Nfft;
+
+                    txSig   = ofdm_modulate(sym, Nfft, cpLen);
+
+                    [rxSig, hSeq] = apply_channel(txSig, snr_dB, chanType, dopplerHz, ...
+                                                  ofdmSymLen, rayleighBlockFading);
+
+                    rxSym = ofdm_demodulate(rxSig, Nfft, cpLen);
+
+                    [rxSymEq, noiseVarEffVec] = equalize_and_noisevar(rxSym, hSeq, ...
+                                                                      noiseVarFromSNR(snr_dB, txSig), Nfft);
+
+                    llr = qam_demod_llr(rxSymEq, M, noiseVarEffVec);
+
+                    if isempty(llrAccum)
+                        llrAccum = llr;
+                    else
+                        L = min(numel(llrAccum), numel(llr));
+                    
+                        % -------- FINAL ROBUST FIX --------
+                        scale = noiseVarEffVec;
+                    
+                        if isscalar(scale)
+                            scaleVec = repmat(scale, L, 1);
+                        else
+                            lenScale = numel(scale);
+                    
+                            if lenScale >= L
+                                scaleVec = scale(1:L);
+                            else
+                                scaleVec = [scale(:); repmat(scale(end), L - lenScale, 1)];
+                            end
+                        end
+                    
+                        llrAccum(1:L) = llrAccum(1:L) + llr(1:L) ./ max(1e-9, abs(scaleVec));
+                    end
+
+                    bitsDec  = fec_decode(llrAccum, rate);
+                    if numel(bitsDec) < numel(bits)
+                        bitsDec = [bitsDec; zeros(numel(bits)-numel(bitsDec),1)];
+                    else
+                        bitsDec = bitsDec(1:numel(bits));
+                    end
+
+                    errRate = sum(bits ~= bitsDec) / numel(bits);
+                    success = (errRate < 0.1);  % allow small errors
+                end
+
+                txBitsAll = [txBitsAll; bits];
+
+                if success
+                    rxBitsAll = [rxBitsAll; bitsDec];
+                else
+                    % -------- FIX: avoid catastrophic PSNR drop --------
+                    % Option 1 (recommended): use previous successful block
+                    if ~isempty(rxBitsAll)
+                        prev = rxBitsAll(end-numel(bits)+1:end);
+                        rxBitsAll = [rxBitsAll; prev];
+                    else
+                        rxBitsAll = [rxBitsAll; zeros(size(bits))];
+                    end
+                end
+
+                bitErrs  = bitErrs + sum(bits~=bitsDec);
+                bitTotal = bitTotal + numel(bits);
+
+                if success
+                    tbSucc = tbSucc + 1;
+                end
+                stats.tx(mcsIdx, si)  = stats.tx(mcsIdx, si) + 1;
+                stats.err(mcsIdx, si) = stats.err(mcsIdx, si) + (~success);
+
+            end
+            numImgBits = numel(img(:)) * 8;
+            rxBitsAllPass = rxBitsAll(1:numImgBits);
+        
+            imgRec = bits_to_img(rxBitsAllPass, img);
+            psnrAccum = psnrAccum + psnr_calc(img, imgRec);
+        end
+
+        berA(si)  = bitErrs/bitTotal;
+        imgRec    = bits_to_img(rxBitsAll, img);
+        %psnrA(si) = psnr_calc(img, imgRec);
+        psnrA(si) = psnrAccum / numPasses;
+        thrA(si)  = (bitsPerFrame * tbSucc) / max(1, totalSubcUses);
+
+        fprintf('Adaptive: SNR=%2d dB, BER=%.3e, PSNR=%.2f, Thr=%.3f\n',...
+            snr_dB, berA(si), psnrA(si), thrA(si));
+    end
+
+    resultsAdaptive.label = 'Adaptive';
+    resultsAdaptive.ber   = berA;
+    resultsAdaptive.psnr  = psnrA;
+    resultsAdaptive.thr   = thrA;
+end
+
+%% =======================================================================
+%%                 EQUALIZATION + EFFECTIVE NOISE VAR
+%% =======================================================================
+function [rxSymEq, noiseVarEffVec] = equalize_and_noisevar(rxSym, hSeq, noiseVar, Nfft)
+% hSeq:
+% - AWGN: scalar 1
+% - Rayleigh block fading: scalar h
+% - Rayleigh per-OFDM-symbol: vector h(ofdmIdx), length = numOfdm
+%
+% rxSym is stacked subcarriers (Nfft*numOfdm x 1)
+
+    if isscalar(hSeq)
+        rxSymEq = rxSym ./ hSeq;
+        noiseVarEff = noiseVar / (abs(hSeq)^2);
+        noiseVarEffVec = noiseVarEff; % scalar ok
+        return;
+    end
+
+    numOfdm = floor(length(rxSym)/Nfft);
+    numOfdm = min(numOfdm, numel(hSeq));
+    rxSymEq = rxSym;
+
+    for s = 1:numOfdm
+        idx = (s-1)*Nfft + (1:Nfft);
+        rxSymEq(idx) = rxSymEq(idx) ./ hSeq(s);
+    end
+
+    noiseVarEffPerSym = noiseVar ./ (abs(hSeq(1:numOfdm)).^2);
+    noiseVarEffVec = repelem(noiseVarEffPerSym(:), Nfft);
+end
+
+%% =======================================================================
+%%                 ADAPTIVE MCS SELECTION (BLER-TARGET)
+%% =======================================================================
+function combos = all_mcs_combos(Mlist, Rlist)
+    combos = zeros(numel(Mlist)*numel(Rlist), 2);
+    idx = 1;
+    for i = 1:numel(Mlist)
+        for j = 1:numel(Rlist)
+            combos(idx,:) = [Mlist(i) Rlist(j)];
+            idx = idx + 1;
+        end
+    end
+    se = log2(combos(:,1)) .* combos(:,2);
+    [~, ord] = sort(se, 'ascend');
+    combos = combos(ord,:);
+end
+
+function [M, R, idxSel] = choose_mcs_blertarget(combos, stats, targetBLER, si)
+    se = log2(combos(:,1)) .* combos(:,2);
+    blerHat = (stats.err(:,si) + 1) ./ (stats.tx(:,si) + 2); % Laplace smoothing
+    ok = blerHat <= targetBLER;
+
+    if any(ok)
+        cand = find(ok);
+        [~, k] = max(se(cand));
+        idxSel = cand(k);
+    else
+        idxSel = 1;
+    end
+
+    M = combos(idxSel,1);
+    R = combos(idxSel,2);
+end
+
+%% =======================================================================
+%%                              HELPERS
+%% =======================================================================
+function [img, bits] = img_to_bits(filename)
+    img = imread(filename);
+    if size(img,3) == 3
+        img = rgb2gray(img);
+    end
+    imgVec = img(:);
+    bits   = de2bi(imgVec, 8, 'left-msb').';
+    bits   = bits(:);
+end
+
+function imgRec = bits_to_img(bits, origImg)
+    nBytes = ceil(numel(bits)/8);
+    bits   = [bits(:); zeros(nBytes*8 - numel(bits),1)];
+    bytes  = bi2de(reshape(bits, 8, []).', 'left-msb');
+    imgRec = reshape(uint8(bytes(1:numel(origImg))), size(origImg));
+end
+
+function [blocks, numBlocks] = segment_bits(bits, bitsPerFrame)
+    bits = bits(:);
+    numBlocks = ceil(numel(bits)/bitsPerFrame);
+    padded    = [bits; zeros(numBlocks*bitsPerFrame - numel(bits),1)];
+    blocks    = reshape(padded, bitsPerFrame, numBlocks);
+end
+
+function txSig = ofdm_modulate(sym, Nfft, cpLen)
+    numSym   = length(sym);
+    numOfdm  = ceil(numSym / Nfft);
+    symPad   = [sym; zeros(numOfdm*Nfft-numSym,1)];
+    symMat   = reshape(symPad, Nfft, numOfdm);
+    timeMat  = ifft(symMat, Nfft, 1);
+    cp       = timeMat(end-cpLen+1:end, :);
+    txMat    = [cp; timeMat];
+    txSig    = txMat(:);
+end
+
+function rxSym = ofdm_demodulate(rxSig, Nfft, cpLen)
+    symLen  = Nfft + cpLen;
+    numOfdm = floor(length(rxSig)/symLen);
+    rxMat   = reshape(rxSig(1:numOfdm*symLen), symLen, numOfdm);
+    rxMat   = rxMat(cpLen+1:end, :);
+    freqMat = fft(rxMat, Nfft, 1);
+    rxSym   = freqMat(:);
+end
+
+% ------------------- CHANNEL (AWGN unchanged, Rayleigh realistic) -------------------
+function [rxSig, hSeq] = apply_channel(txSig, snr_dB, chanType, dopplerHz, ofdmSymLen, rayleighBlockFading) %#ok<INUSD>
+    switch lower(chanType)
+        case 'awgn'
+            % Preserve AWGN behavior
+            hSeq = 1;
+            rxSig = awgn(txSig, snr_dB, 'measured');
+
+        case 'rayleigh'
+            % Noise referenced to TX power (pre-fade) so deep fades hurt.
+            txPow = mean(abs(txSig).^2);
+            noisePow = txPow * 10.^(-snr_dB/10); % complex noise power E|n|^2
+
+            noise = sqrt(noisePow/2) * (randn(size(txSig)) + 1j*randn(size(txSig)));
+
+            if rayleighBlockFading
+                h = (randn + 1j*randn)/sqrt(2);
+                rxSig = h * txSig + noise;
+                hSeq = h;
+            else
+                numSym = floor(length(txSig)/ofdmSymLen);
+                if numSym < 1
+                    numSym = 1;
+                end
+                hSeq = (randn(numSym,1) + 1j*randn(numSym,1))/sqrt(2);
+
+                rxSig = txSig;
+                for s = 1:numSym
+                    idx = (s-1)*ofdmSymLen + (1:ofdmSymLen);
+                    if idx(end) > length(txSig)
+                        idx = idx(idx <= length(txSig));
+                    end
+                    rxSig(idx) = hSeq(s) * txSig(idx);
+                end
+                rxSig = rxSig + noise;
+            end
+        case 'rician'
+            K = 6;
+        
+            txPow = mean(abs(txSig).^2);
+            noisePow = txPow * 10.^(-snr_dB/10);
+        
+            noise = sqrt(noisePow/2) * (randn(size(txSig)) + 1j*randn(size(txSig)));
+        
+            numSym = floor(length(txSig)/ofdmSymLen);
+            if numSym < 1, numSym = 1; end
+        
+            h_los = sqrt(K/(K+1));
+            h_nlos = sqrt(1/(K+1)) * ...
+                (randn(numSym,1)+1j*randn(numSym,1))/sqrt(2);
+        
+            hSeq = h_los + h_nlos;
+        
+            rxSig = txSig;
+            for s = 1:numSym
+                idx = (s-1)*ofdmSymLen + (1:ofdmSymLen);
+                idx = idx(idx <= length(txSig));
+                rxSig(idx) = hSeq(s) * txSig(idx);
+            end
+            rxSig = rxSig + noise;
+        otherwise
+            error('Unknown channel type: %s', chanType);
+    end
+end
+
+function bitsEnc = fec_encode(bits, rate)
+    bits = bits(:);
+    switch rate
+        case 1/2
+            bitsEnc = repelem(bits, 2);
+
+        case 3/4
+            rep  = repelem(bits, 2);
+            mask = true(size(rep));
+            mask(4:4:end) = false;   % keep [1 1 1 0]
+            bitsEnc = rep(mask);
+
+        otherwise
+            bitsEnc = bits;
+    end
+end
+
+function bitsDec = fec_decode(llr, rate)
+    switch rate
+        case 1/2
+            N = floor(numel(llr)/2);
+            llr2   = reshape(llr(1:2*N), 2, []).';
+            llrSum = sum(llr2,2);
+            bitsDec = llrSum < 0;
+
+        case 3/4
+            L = numel(llr);
+            N = floor((2/3)*L);
+            if N <= 0
+                bitsDec = [];
+                return;
+            end
+
+            punctPattern = [1 1 1 0];
+            llr_full = zeros(2*N,1);
+
+            inIdx = 1;
+            for k = 1:(2*N)
+                keep = punctPattern(mod(k-1,4)+1);
+                if keep
+                    if inIdx <= L
+                        llr_full(k) = llr(inIdx);
+                        inIdx = inIdx + 1;
+                    else
+                        llr_full(k) = 0;
+                    end
+                else
+                    llr_full(k) = 0;
+                end
+            end
+
+            llr2   = reshape(llr_full, 2, []).';
+            llrSum = sum(llr2,2);
+            bitsDec = llrSum < 0;
+
+        otherwise
+            bitsDec = llr < 0;
+    end
+end
+
+function sym = qam_mod_bits(bits, M)
+    k = log2(M);
+    bits = bits(:);
+    if mod(numel(bits),k) ~= 0
+        bits = [bits; zeros(k - mod(numel(bits),k),1)];
+    end
+    symbols = bi2de(reshape(bits, k, []).', 'left-msb');
+    sym     = qammod(symbols, M, 'UnitAveragePower', true);
+end
+
+function llr = qam_demod_llr(rxSym, M, noiseVar)
+% noiseVar can be scalar or vector aligned to rxSym
+    k = log2(M);
+    symSet = qammod(0:M-1, M, 'UnitAveragePower', true);
+    bitMap = de2bi(0:M-1, k, 'left-msb');
+
+    llr = zeros(k*length(rxSym),1);
+
+    if isscalar(noiseVar)
+        for i = 1:length(rxSym)
+            r  = rxSym(i);
+            d2 = abs(r - symSet).^2;
+            for b = 1:k
+                idx0 = bitMap(:,b)==0;
+                idx1 = bitMap(:,b)==1;
+                llr((i-1)*k + b) = logsumexp(-d2(idx0)/noiseVar) - ...
+                                   logsumexp(-d2(idx1)/noiseVar);
+            end
+        end
+    else
+        L = min(length(rxSym), length(noiseVar));
+        for i = 1:L
+            nv = noiseVar(i);
+            r  = rxSym(i);
+            d2 = abs(r - symSet).^2;
+            for b = 1:k
+                idx0 = bitMap(:,b)==0;
+                idx1 = bitMap(:,b)==1;
+                llr((i-1)*k + b) = logsumexp(-d2(idx0)/nv) - ...
+                                   logsumexp(-d2(idx1)/nv);
+            end
+        end
+        for i = L+1:length(rxSym)
+            nv = noiseVar(end);
+            r  = rxSym(i);
+            d2 = abs(r - symSet).^2;
+            for b = 1:k
+                idx0 = bitMap(:,b)==0;
+                idx1 = bitMap(:,b)==1;
+                llr((i-1)*k + b) = logsumexp(-d2(idx0)/nv) - ...
+                                   logsumexp(-d2(idx1)/nv);
+            end
+        end
+    end
+end
+
+function y = logsumexp(x)
+    m = max(x);
+    y = m + log(sum(exp(x-m)));
+end
+
+function val = psnr_calc(orig, rec)
+    orig = double(orig); 
+    rec  = double(rec);
+
+    mse  = mean((orig(:)-rec(:)).^2);
+
+    if mse < 1e-10
+        val = 60; % cap realistically instead of 99
+    else
+        val = 10*log10(255^2 / mse);
+    end
+end
+
+%% =======================================================================
+%%                           PLOTTING (PER CHANNEL)
+%% =======================================================================
+function plot_results_5g_channel(resultsFixed, resultsAdaptive, snrRange_dB, chanName)
+    labels = {resultsFixed.label};
+    labels{end+1} = resultsAdaptive.label;
+
+    % -------- BER vs SNR --------
+    figure('Name',sprintf('BER vs SNR (%s)',chanName),'NumberTitle','off');
+    hold on; grid on;
+    for k = 1:length(resultsFixed)
+        semilogy(snrRange_dB, resultsFixed(k).ber, '-o','LineWidth',1.5);
+    end
+    semilogy(snrRange_dB, resultsAdaptive.ber, '-s','LineWidth',1.8);
+    xlabel('SNR (dB)'); ylabel('BER');
+    legend(labels, 'Location','southwest');
+    title(sprintf('BER vs SNR (%s)',chanName));
+
+    % -------- PSNR vs SNR --------
+    figure('Name',sprintf('Image PSNR vs SNR (%s)',chanName),'NumberTitle','off');
+    hold on; grid on;
+    for k = 1:length(resultsFixed)
+        plot(snrRange_dB, resultsFixed(k).psnr, '-o','LineWidth',1.5);
+    end
+    plot(snrRange_dB, resultsAdaptive.psnr, '-s','LineWidth',1.8);
+    xlabel('SNR (dB)'); ylabel('PSNR (dB)');
+    legend(labels, 'Location','southeast');
+    title(sprintf('Image PSNR vs SNR (%s)',chanName));
+
+    % -------- Throughput vs SNR --------
+    figure('Name',sprintf('Throughput vs SNR (%s)',chanName),'NumberTitle','off');
+    hold on; grid on;
+    for k = 1:length(resultsFixed)
+        plot(snrRange_dB, resultsFixed(k).thr, '-o','LineWidth',1.5);
+    end
+    plot(snrRange_dB, resultsAdaptive.thr, '-s','LineWidth',1.8);
+    xlabel('SNR (dB)'); ylabel('Throughput (bits / subcarrier-use)');
+    legend(labels, 'Location','southeast');
+    title(sprintf('Throughput vs SNR (channel-use normalized) (%s)',chanName));
+end
