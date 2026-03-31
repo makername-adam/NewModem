@@ -48,7 +48,7 @@ function main_5g_nr_modem_dual
     %% ----------------- PLOT: 6 GRAPHS (3 AWGN + 3 Rayleigh) -----------------
     plot_results_5g_channel(results.awgn.fixed, results.awgn.adaptive, snrRange_dB, 'AWGN');
     plot_results_5g_channel(results.rayleigh.fixed, results.rayleigh.adaptive, snrRange_dB, 'Rayleigh');
-    plot_results_5g_channel(results.rayleigh.fixed, results.rayleigh.adaptive, snrRange_dB, 'Rician');
+    plot_results_5g_channel(results.rician.fixed, results.rician.adaptive, snrRange_dB, 'Rician');
     disp('Done. Figures generated.');
 end
 
