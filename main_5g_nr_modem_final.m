@@ -3,8 +3,8 @@ function main_5g_nr_modem_dual
     clear; clc; close all;
 
     %% ----------------- USER PARAMETERS -----------------
-    imgFile      = fullfile('images','campus.jpeg');   % adjust name if needed
-    bitsPerFrame = 2048;              % TB length (information bits)
+    imgFile      = fullfile('images','campus.jpg');   % adjust name if needed
+    bitsPerFrame = 8192;              % TB length (information bits)
     snrRange_dB  = 0:4:24;            % SNR points
     modSchemes   = [4 16 64];         % QPSK, 16QAM, 64QAM
     codeRates    = [1/2 3/4];         % punctured repetition-based FEC
@@ -12,12 +12,12 @@ function main_5g_nr_modem_dual
     cpLen        = 16;                % CP length
     dopplerHz    = 5;                 % placeholder (not explicitly simulated)
     harqMaxTx    = 3;                 % HARQ attempts
-    numPasses    = 2;                 % repeat image per SNR for stability
+    numPasses    = 3;                 % repeat image per SNR for stability
 
     % Rayleigh realism knob:
     % false = per-OFDM-symbol flat fading (more realistic, more different from AWGN)
     % true  = block fading for entire waveform
-    rayleighBlockFading = false;
+    rayleighBlockFading = true;
 
     rng(1);                           % reproducible
 
@@ -26,7 +26,7 @@ function main_5g_nr_modem_dual
     [txBlocks, numBlocks] = segment_bits(imgBits, bitsPerFrame);
     fprintf('Image bits: %d, blocks: %d\n', numel(imgBits), numBlocks);
 
-    %% ----------------- RUN BOTH CHANNELS -----------------
+    %% ----------------- RUN ALL CHANNELS -----------------
     chanList = {'awgn','rayleigh', 'rician'};
     results = struct();
 
@@ -45,11 +45,10 @@ function main_5g_nr_modem_dual
         results.(chanType).adaptive = resA;
     end
 
-    %% ----------------- PLOT: 6 GRAPHS (3 AWGN + 3 Rayleigh) -----------------
+    %% ----------------- PLOT: 9 GRAPHS (3 AWGN + 3 Rayleigh + 3 Rician) -----------------
     plot_results_5g_channel(results.awgn.fixed, results.awgn.adaptive, snrRange_dB, 'AWGN');
     plot_results_5g_channel(results.rayleigh.fixed, results.rayleigh.adaptive, snrRange_dB, 'Rayleigh');
     plot_results_5g_channel(results.rician.fixed, results.rician.adaptive, snrRange_dB, 'Rician');
-
     disp('Done. Figures generated.');
 end
 
@@ -94,12 +93,13 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
             snr_dB = snrRange_dB(si);
 
             bitErrs = 0; bitTotal = 0;
-            txBitsAll = []; rxBitsAll = [];
+            
 
             tbSucc = 0;
             totalSubcUses = 0;
 
             for pass = 1:numPasses
+                txBitsAll = []; rxBitsAll = [];
                 for b = 1:numBlocks
                     bits = txBlocks(:,b);
 
@@ -165,6 +165,8 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
             end
 
             ber(si)      = bitErrs/bitTotal;
+            numImgBits = numel(img(:)) * 8;
+            rxBitsAll  = rxBitsAll(1:numImgBits);
             imgRec       = bits_to_img(rxBitsAll, img);
             psnrVals(si) = psnr_calc(img, imgRec);
             thr(si)      = (bitsPerFrame * tbSucc) / max(1, totalSubcUses);
@@ -191,19 +193,34 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
     thrA  = zeros(size(snrRange_dB));
 
     for si = 1:length(snrRange_dB)
+       
         snr_dB = snrRange_dB(si);
 
         bitErrs = 0; bitTotal = 0;
-        txBitsAll = []; rxBitsAll = [];
-
+        
         tbSucc = 0;
         totalSubcUses = 0;
 
         for pass = 1:numPasses
+            txBitsAll = []; rxBitsAll = [];
             for b = 1:numBlocks
                 bits = txBlocks(:,b);
 
-                [M, rate, mcsIdx] = choose_mcs_blertarget(combos, stats, cfg.targetBLER, si);
+                [M, rate, mcsIdx] = choose_mcs_blertarget(combos, stats, cfg.targetBLER, si, snr_dB);
+
+          
+                % if snr_dB < 8
+                %     M = 4;  rate = 1/2;
+                % 
+                % elseif snr_dB < 16
+                %     M = 16; rate = 1/2;
+                % 
+                % elseif snr_dB < 22
+                %     M = 16; rate = 3/4;
+                % 
+                % else
+                %     M = 64; rate = 1/2;   % NOTE: NOT 3/4
+                % end
 
                 txCount = 0;
                 success = false;
@@ -261,6 +278,8 @@ function [resultsFixed, resultsAdaptive] = sim_fixed_and_adaptive( ...
         end
 
         berA(si)  = bitErrs/bitTotal;
+        numImgBits = numel(img(:)) * 8;
+        rxBitsAll  = rxBitsAll(1:numImgBits);
         imgRec    = bits_to_img(rxBitsAll, img);
         psnrA(si) = psnr_calc(img, imgRec);
         thrA(si)  = (bitsPerFrame * tbSucc) / max(1, totalSubcUses);
@@ -323,14 +342,31 @@ function combos = all_mcs_combos(Mlist, Rlist)
     combos = combos(ord,:);
 end
 
-function [M, R, idxSel] = choose_mcs_blertarget(combos, stats, targetBLER, si)
+function [M, R, idxSel] = choose_mcs_blertarget(combos, stats, targetBLER, si, snr_dB)
+
     se = log2(combos(:,1)) .* combos(:,2);
-    blerHat = (stats.err(:,si) + 1) ./ (stats.tx(:,si) + 2); % Laplace smoothing
-    ok = blerHat <= targetBLER;
+    blerHat = (stats.err(:,si) + 1) ./ (stats.tx(:,si) + 2);
+
+    % Small margin for fading uncertainty
+    snrMargin_dB = 2;
+    effectiveSNR = snr_dB - snrMargin_dB;
+
+    maxM = 4;
+    if effectiveSNR >= 4
+        maxM = 16;
+    end
+    if effectiveSNR >= 16
+        maxM = 64;
+    end
+
+    validIdx = combos(:,1) <= maxM;
+    ok = (blerHat <= targetBLER) & validIdx;
+
+    effSE = se .* (1 - blerHat);
 
     if any(ok)
         cand = find(ok);
-        [~, k] = max(se(cand));
+        [~, k] = max(effSE(cand));
         idxSel = cand(k);
     else
         idxSel = 1;
@@ -339,6 +375,24 @@ function [M, R, idxSel] = choose_mcs_blertarget(combos, stats, targetBLER, si)
     M = combos(idxSel,1);
     R = combos(idxSel,2);
 end
+
+% function [M, R, idxSel] = choose_mcs_blertarget(combos, stats, targetBLER, si)
+%     se = log2(combos(:,1)) .* combos(:,2);
+%     blerHat = (stats.err(:,si) + 1) ./ (stats.tx(:,si) + 2); % Laplace smoothing
+%     ok = blerHat <= 0.2;
+% 
+%     if any(ok)
+%         cand = find(ok);
+%         effSE = se .* (1 - blerHat);
+%         [~, k] = max(effSE(cand));
+%         idxSel = cand(k);
+%     else
+%         idxSel = 1;
+%     end
+% 
+%     M = combos(idxSel,1);
+%     R = combos(idxSel,2);
+% end
 
 %% =======================================================================
 %%                              HELPERS
@@ -391,15 +445,16 @@ end
 function [rxSig, hSeq] = apply_channel(txSig, snr_dB, chanType, dopplerHz, ofdmSymLen, rayleighBlockFading) %#ok<INUSD>
     switch lower(chanType)
         case 'awgn'
-            % Preserve AWGN behavior
             hSeq = 1;
-            rxSig = awgn(txSig, snr_dB, 'measured');
+            txPow = mean(abs(txSig).^2);
+            noisePow = txPow * 10.^(-snr_dB/10);
+            noise = sqrt(noisePow/2) * (randn(size(txSig)) + 1j*randn(size(txSig)));
+            rxSig = txSig + noise;
 
         case 'rayleigh'
             % Noise referenced to TX power (pre-fade) so deep fades hurt.
             txPow = mean(abs(txSig).^2);
             noisePow = txPow * 10.^(-snr_dB/10); % complex noise power E|n|^2
-
             noise = sqrt(noisePow/2) * (randn(size(txSig)) + 1j*randn(size(txSig)));
 
             if rayleighBlockFading
@@ -423,8 +478,9 @@ function [rxSig, hSeq] = apply_channel(txSig, snr_dB, chanType, dopplerHz, ofdmS
                 end
                 rxSig = rxSig + noise;
             end
+
         case 'rician'
-            K = 6;
+            K = 10;
         
             txPow = mean(abs(txSig).^2);
             noisePow = txPow * 10.^(-snr_dB/10);
@@ -613,7 +669,7 @@ function plot_results_5g_channel(resultsFixed, resultsAdaptive, snrRange_dB, cha
     title(sprintf('Image PSNR vs SNR (%s)',chanName));
 
     % -------- Throughput vs SNR --------
-    figure('Name',sprintf('Goodput vs SNR (%s)',chanName),'NumberTitle','off');
+    figure('Name',sprintf('Throughput vs SNR (%s)',chanName),'NumberTitle','off');
     hold on; grid on;
     for k = 1:length(resultsFixed)
         plot(snrRange_dB, resultsFixed(k).thr, '-o','LineWidth',1.5);
