@@ -696,10 +696,10 @@ function plot_results_5g_channel(resultsFixed, resultsAdaptive, snrRange_dB, cha
     figure('Name',sprintf('SSIM vs SNR (%s)',chanName),'NumberTitle','off');
     hold on; grid on;
     for k = 1:length(resultsFixed)
-        plot(snrRange_dB, resultsFixed(k).ssim, '-o','LineWidth',1.5);
+        plot(snrRange_dB, resultsFixed(k).thr, '-o','LineWidth',1.5);
     end
-    plot(snrRange_dB, resultsAdaptive.ssim, '-s','LineWidth',1.8);
-    xlabel('SNR (dB)'); ylabel('SSIM');
+    plot(snrRange_dB, resultsAdaptive.thr, '-s','LineWidth',1.8);
+    xlabel('SNR (dB)'); ylabel('Throughput (bits / subcarrier-use)');
     legend(labels, 'Location','southeast');
-    title(sprintf('SSIM vs SNR (channel-use normalized) (%s)',chanName));
+    title(sprintf('Throughput vs SNR (channel-use normalized) (%s)',chanName));
 end
