@@ -6,10 +6,10 @@
 
 This project presents a **5G-inspired link-level simulation framework** for image transmission over wireless channels using MATLAB. The system integrates key physical-layer concepts including **OFDM modulation, adaptive modulation and coding (AMC), and HARQ with Chase combining**, and evaluates performance across **AWGN, Rayleigh, and Rician fading channels**.
 
-The objective is to analyze how adaptive transmission strategies impact:
+The objective is to analyze how adaptive transmission strategies and the channel impact:
 
 * Bit Error Rate (BER)
-* Image Quality (PSNR)
+* Image Quality (PSNR, SSIM)
 * Spectral Efficiency (Throughput)
 
 ---
@@ -41,13 +41,17 @@ main_5g_nr_modem_dual
 
 * Image is loaded and converted to a bitstream
 * Bits are segmented into transport blocks
+* Blocks of bits are modulated into blocks of symbols (QAM)
+* Blocks of symbols are IFFT into a signal
 * Transmission is simulated over:
 
   * AWGN channel
   * Rayleigh fading channel
   * Rician fading channel
-* Performance metrics are computed
-* 9 figures are generated:
+*  Signal is FFT into blocks of symbols
+*  Blocks of symbols are demodulated into blocks of bits
+*  Performance metrics are computed (BER, PSNR, SSIM, throughput)
+* 9 figures are generated for the adaptive MCS, as well as selected fixed MCS:
 
   * BER vs SNR (3 channels)
   * PSNR vs SNR (3 channels)
@@ -77,12 +81,12 @@ rayleighBlockFading = true;
 
 ### 1. Main Controller
 
-`main_5g_nr_modem_dual`
+`main_5g_nr_modem_dual` function
 
 * Initializes parameters
 * Loads image and prepares bitstream
-* Executes simulation for all channel types
-* Triggers visualization
+* Executes simulation for all channel types by calling `sim_fixed_and_adaptive`
+* Triggers visualization by calling `plot_results_5g_channel`
 
 ---
 
@@ -92,6 +96,8 @@ rayleighBlockFading = true;
 
 Handles:
 
+Using the channel given
+* Values given for the parameters 
 * Fixed MCS evaluation
 * Adaptive MCS evaluation
 * HARQ retransmissions
@@ -141,15 +147,23 @@ Supports:
 
 ### 6. Forward Error Correction (FEC)
 
+Either:
 * Rate 1/2 → repetition coding
 * Rate 3/4 → punctured repetition
 
+functions:
+* `fec_encode`
+* `fec_decode`
 ---
 
 ### 7. Modulation & Demodulation
 
 * QPSK, 16QAM, 64QAM supported
 * LLR-based soft demodulation
+
+functions:
+* `qam_mod_bits`
+* `qam_demod_llr`
 
 ---
 
@@ -168,7 +182,12 @@ Supports:
 | ---------- | ---------------------------- |
 | BER        | Bit-level error rate         |
 | PSNR       | Image reconstruction quality |
+| SSIM       | Image reconstruction quality |
 | Throughput | Bits per subcarrier-use      |
+
+functions:
+* `psnr_calc`
+* `SSIM_calc`
 
 ---
 
@@ -260,7 +279,7 @@ This is a **simplified 5G-like system**, not a full 3GPP NR implementation:
 
 Developed for:
 
-**SYSC 5804 F – Wireless Communications (Winter 2026) at Carleton University**
+**SYSC 5804 X – Software for Mobile Networks (Winter 2026) at Carleton University**
 
 Focus:
 
